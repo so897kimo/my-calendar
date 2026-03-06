@@ -1,0 +1,418 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>校務行事管理系統</title>
+    <!-- 載入 React, Babel, Tailwind, Lucide -->
+    <script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+    <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://unpkg.com/lucide@latest"></script>
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;700;900&display=swap');
+        body { font-family: 'Inter', 'Microsoft JhengHei', sans-serif; }
+        @media print {
+            .no-print { display: none !important; }
+            .no-print-flex { display: grid !important; }
+            body { background-color: white !important; padding: 0 !important; }
+            .report-container { box-shadow: none !important; border: none !important; width: 100% !important; max-width: 100% !important; margin: 0 !important; border-radius: 0 !important; padding: 1cm !important; }
+            table, th, td { border-color: black !important; color: black !important; border-width: 1px !important; }
+            .bg-slate-50, .bg-indigo-50, .bg-emerald-50, .bg-slate-100 { background-color: transparent !important; }
+            .bg-emerald-500 { background-color: #10b981 !important; -webkit-print-color-adjust: exact; }
+            .bg-indigo-500 { background-color: #6366f1 !important; -webkit-print-color-adjust: exact; }
+            h2, h3 { color: black !important; }
+        }
+    </style>
+</head>
+<body class="bg-slate-50">
+    <div id="root"></div>
+
+    <script type="text/babel">
+        const { useState, useEffect, useCallback, useMemo } = React;
+
+        // 模擬 Lucide 圖示元件 (在 HTML CDN 環境中使用)
+        const Icon = ({ name, size = 24, className = "" }) => {
+            const [svg, setSvg] = useState("");
+            useEffect(() => {
+                if (window.lucide) {
+                    const icon = window.lucide.icons[name];
+                    if (icon) {
+                        setSvg(window.lucide.createIcons());
+                    }
+                }
+            }, [name]);
+            // 由於 CDN 環境處理圖示較複雜，這裡改用直接注入 class 的方式讓 Lucide 自動渲染
+            return <i data-lucide={name} style={{ width: size, height: size }} className={`${className}`}></i>;
+        };
+
+        // 重新封裝常用的圖示
+        const CalendarIcon = (props) => <Icon name="calendar" {...props} />;
+        const PrinterIcon = (props) => <Icon name="printer" {...props} />;
+        const RefreshIcon = (props) => <Icon name="refresh-cw" {...props} />;
+        const ListIcon = (props) => <Icon name="clipboard-list" {...props} />;
+        const GridIcon = (props) => <Icon name="layout-grid" {...props} />;
+        const ChartIcon = (props) => <Icon name="bar-chart-3" {...props} />;
+        const EditIcon = (props) => <Icon name="edit-3" {...props} />;
+
+        const CHINESE_MONTHS = ["一", "二", "三", "四", "五", "六", "七", "八", "九", "十", "十一", "十二"];
+        const STORAGE_KEY = "cal_report_ical_url";
+        const OFFICES = ["教導處", "總務處", "教務組", "訓導組", "輔導室", "人事室", "會計室"];
+
+        const App = () => {
+            const [reportMode, setReportMode] = useState("semester"); 
+            const [selectedWeek, setSelectedWeek] = useState(1);
+            const [reportTitle, setReportTitle] = useState("學期行事週報表");
+            const [icalUrl, setIcalUrl] = useState(() => localStorage.getItem(STORAGE_KEY) || "");
+            const [events, setEvents] = useState([]);
+            const [startDate, setStartDate] = useState("2026-02-01");
+            const [weekCount, setWeekCount] = useState(20);
+            const [fontSize, setFontSize] = useState(14);
+            const [loading, setLoading] = useState(false);
+            const [error, setError] = useState("");
+            const [monitorStart, setMonitorStart] = useState("2026-02-01");
+            const [monitorEnd, setMonitorEnd] = useState("2026-02-28");
+            const [stagedEvents, setStagedEvents] = useState([]);
+            const [editForm, setEditForm] = useState({ date: new Date().toISOString().split('T')[0], office: "教導處", title: "", progress: "0" });
+
+            useEffect(() => {
+                if (window.lucide) window.lucide.createIcons();
+            });
+
+            useEffect(() => {
+                if (icalUrl) localStorage.setItem(STORAGE_KEY, icalUrl);
+            }, [icalUrl]);
+
+            const parseProgress = (summary) => {
+                if (!summary) return { progress: 0, isDone: false, cleanTitle: "" };
+                if (summary.includes("[DONE]") || summary.includes("[已完成]") || summary.includes(" (100%)")) {
+                    return { progress: 100, isDone: true, cleanTitle: summary.replace(/\[DONE\]|\[已完成\]| \(100%\)/g, "").trim() };
+                }
+                const percentMatch = summary.match(/\((\d+)%\)/);
+                if (percentMatch) {
+                    const p = parseInt(percentMatch[1]);
+                    return { progress: p, isDone: p >= 100, cleanTitle: summary.replace(percentMatch[0], "").trim() };
+                }
+                return { progress: 0, isDone: false, cleanTitle: summary };
+            };
+
+            const parseICS = (data) => {
+                const events = [];
+                const lines = data.split(/\r?\n/);
+                let currentEvent = null;
+                for (let line of lines) {
+                    if (line.startsWith('BEGIN:VEVENT')) currentEvent = {};
+                    else if (line.startsWith('END:VEVENT')) {
+                        if (currentEvent && currentEvent.start) {
+                            const { progress, isDone, cleanTitle } = parseProgress(currentEvent.summary);
+                            events.push({ ...currentEvent, progress, isDone, cleanTitle });
+                        }
+                        currentEvent = null;
+                    } else if (currentEvent) {
+                        if (line.startsWith('SUMMARY:')) currentEvent.summary = line.replace('SUMMARY:', '').trim();
+                        else if (line.startsWith('DTSTART')) {
+                            const val = line.split(':')[1];
+                            currentEvent.start = val.substring(0, 4) + '-' + val.substring(4, 6) + '-' + val.substring(6, 8);
+                        }
+                    }
+                }
+                return events;
+            };
+
+            const fetchIcalData = useCallback(async () => {
+                if (!icalUrl) return;
+                setLoading(true);
+                setError("");
+                try {
+                    const proxyUrl = `https://corsproxy.io/?${encodeURIComponent(icalUrl)}`;
+                    const response = await fetch(proxyUrl);
+                    if (!response.ok) throw new Error("無法讀取網址。");
+                    const data = await response.text();
+                    setEvents(parseICS(data));
+                } catch (err) {
+                    setError("讀取失敗：請檢查 iCal 網址是否正確。");
+                } finally {
+                    setLoading(false);
+                }
+            }, [icalUrl]);
+
+            useEffect(() => { if (icalUrl) fetchIcalData(); }, []);
+
+            const formatEventLabel = (dateStr) => {
+                const d = new Date(dateStr);
+                return `${d.getMonth() + 1}/${d.getDate()}(${['日','一','二','三','四','五','六'][d.getDay()]})`;
+            };
+
+            const tableData = useMemo(() => {
+                const rows = [];
+                const start = new Date(startDate);
+                const firstSunday = new Date(start);
+                firstSunday.setDate(start.getDate() - start.getDay());
+                for (let i = 0; i < weekCount; i++) {
+                    const weekStart = new Date(firstSunday);
+                    weekStart.setDate(firstSunday.getDate() + (i * 7));
+                    const weekEnd = new Date(weekStart); weekEnd.setDate(weekStart.getDate() + 6);
+                    const days = [];
+                    for (let j = 0; j < 7; j++) {
+                        const d = new Date(weekStart); d.setDate(weekStart.getDate() + j);
+                        const dStr = d.toLocaleDateString('en-CA');
+                        const isHoliday = events.some(ev => ev.start === dStr && (ev.summary?.includes("假") || ev.summary?.includes("休") || ev.summary?.includes("節")));
+                        days.push({ num: d.getDate(), isOffDay: (d.getDay() === 0 || d.getDay() === 6) || isHoliday });
+                    }
+                    const weekEvents = events.filter(ev => { const d = new Date(ev.start); return d >= weekStart && d <= weekEnd; }).sort((a,b) => new Date(a.start)-new Date(b.start));
+                    rows.push({ weekNum: i + 1, month: weekStart.getMonth() + 1, weekStart, weekEnd, days, events: weekEvents });
+                }
+                return rows;
+            }, [startDate, weekCount, events]);
+
+            useEffect(() => {
+                if (reportMode === 'monitoring' || reportMode === 'weekly') {
+                    const week = tableData.find(w => w.weekNum === selectedWeek);
+                    if (week) {
+                        setMonitorStart(week.weekStart.toLocaleDateString('en-CA'));
+                        setMonitorEnd(week.weekEnd.toLocaleDateString('en-CA'));
+                    }
+                }
+            }, [selectedWeek, reportMode, tableData]);
+
+            const monitorAnalysis = useMemo(() => {
+                const sDate = new Date(monitorStart); const eDate = new Date(monitorEnd); eDate.setHours(23,59,59,999);
+                const filtered = events.filter(ev => { const d = new Date(ev.start); return d >= sDate && d <= eDate; });
+                const completed = filtered.filter(e => e.isDone);
+                const incomplete = filtered.filter(e => !e.isDone);
+                const avg = filtered.length > 0 ? Math.round(filtered.reduce((acc, curr) => acc + curr.progress, 0) / filtered.length) : 0;
+                return { total: filtered.length, completed, incomplete, avg };
+            }, [events, monitorStart, monitorEnd]);
+
+            const categorizedEvents = useMemo(() => {
+                const current = tableData.find(w => w.weekNum === selectedWeek);
+                if (!current) return {};
+                const groups = {};
+                current.events.forEach(ev => {
+                    const match = ev.cleanTitle?.match(/^\[(.*?)\]/);
+                    const cat = match ? match[1] : "通用事項";
+                    const title = match ? ev.cleanTitle.replace(match[0], '').trim() : ev.cleanTitle;
+                    if (!groups[cat]) groups[cat] = [];
+                    groups[cat].push({ ...ev, finalTitle: title });
+                });
+                return groups;
+            }, [selectedWeek, tableData]);
+
+            const addToStaged = () => {
+                if (!editForm.title) return;
+                const progressTag = editForm.progress === "100" ? "[已完成]" : `(${editForm.progress}%)`;
+                const fullTitle = `[${editForm.office}] ${editForm.title} ${progressTag}`;
+                setStagedEvents([...stagedEvents, { ...editForm, fullTitle, id: Date.now() }]);
+                setEditForm({ ...editForm, title: "" });
+            };
+
+            const exportCSV = () => {
+                const headers = "Subject,Start Date,All Day Event,Description,Private\n";
+                const content = stagedEvents.map(ev => {
+                    const [y, m, d] = ev.date.split('-');
+                    return `"${ev.fullTitle}","${m}/${d}/${y}","True","由校務管理系統匯出","False"`;
+                }).join("\n");
+                const blob = new Blob([headers + content], { type: 'text/csv;charset=utf-8;' });
+                const url = URL.createObjectURL(blob);
+                const link = document.createElement("a");
+                link.setAttribute("href", url);
+                link.setAttribute("download", `calendar_export.csv`);
+                link.click();
+            };
+
+            const copyToEditor = (ev) => {
+                const match = ev.cleanTitle.match(/^\[(.*?)\]/);
+                const office = match ? match[1] : OFFICES[0];
+                const title = match ? ev.cleanTitle.replace(match[0], '').trim() : ev.cleanTitle;
+                setEditForm({ date: ev.start, office, title, progress: ev.progress.toString() });
+                setReportMode("editor");
+            };
+
+            return (
+                <div className="min-h-screen p-4 md:p-8">
+                    {/* 控制面板 */}
+                    <div className="max-w-7xl mx-auto mb-6 bg-white rounded-2xl shadow-sm border p-6 no-print">
+                        <div className="flex flex-wrap items-center justify-between gap-4 mb-6">
+                            <div className="flex items-center gap-4">
+                                <div className="p-3 bg-indigo-600 rounded-xl text-white shadow-lg"><CalendarIcon /></div>
+                                <div>
+                                    <h1 className="text-2xl font-bold text-slate-900">校務行事管理系統</h1>
+                                    <p className="text-sm text-slate-500">同步 iCal / 報表列印 / 進度監控</p>
+                                </div>
+                            </div>
+                            <div className="flex flex-wrap gap-2 bg-slate-100 p-1.5 rounded-2xl">
+                                <button onClick={() => setReportMode('semester')} className={`px-4 py-2 rounded-xl text-sm font-bold ${reportMode === 'semester' ? 'bg-white shadow-md text-indigo-600' : 'text-slate-500'}`}>全學期</button>
+                                <button onClick={() => setReportMode('weekly')} className={`px-4 py-2 rounded-xl text-sm font-bold ${reportMode === 'weekly' ? 'bg-white shadow-md text-indigo-600' : 'text-slate-500'}`}>週行事曆</button>
+                                <button onClick={() => setReportMode('monitoring')} className={`px-4 py-2 rounded-xl text-sm font-bold ${reportMode === 'monitoring' ? 'bg-white shadow-md text-indigo-600' : 'text-slate-500'}`}>進度監控</button>
+                                <button onClick={() => setReportMode('editor')} className={`px-4 py-2 rounded-xl text-sm font-bold ${reportMode === 'editor' ? 'bg-white shadow-md text-indigo-600' : 'text-slate-500'}`}>編輯/匯出</button>
+                            </div>
+                        </div>
+
+                        <div className="grid grid-cols-1 md:grid-cols-2 gap-6 pt-4 border-t">
+                            <div className="space-y-4">
+                                <label className="text-xs font-black text-slate-400 uppercase">Google iCal 網址</label>
+                                <div className="flex gap-2">
+                                    <input type="text" value={icalUrl} onChange={(e) => setIcalUrl(e.target.value)} className="flex-1 border rounded-xl px-4 py-2 text-sm bg-slate-50 outline-none focus:ring-2 focus:ring-indigo-500" />
+                                    <button onClick={fetchIcalData} className="bg-indigo-600 text-white px-4 py-2 rounded-xl"><RefreshIcon size={18} className={loading ? 'animate-spin' : ''} /></button>
+                                </div>
+                            </div>
+                            <div className="grid grid-cols-3 gap-4">
+                                <div className="col-span-3">
+                                    <label className="text-xs font-black text-slate-400">報表標題</label>
+                                    <input type="text" value={reportTitle} onChange={(e) => setReportTitle(e.target.value)} className="w-full border rounded-lg p-2 bg-slate-50 text-xs font-bold" />
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+
+                    {/* 報表區域 */}
+                    <div className="max-w-7xl mx-auto bg-white shadow-2xl report-container p-10 rounded-sm border border-gray-300 min-h-[800px] relative">
+                        {reportMode !== 'editor' && (
+                            <button onClick={() => window.print()} className="absolute top-4 right-4 no-print bg-indigo-600 text-white p-2 rounded-full shadow-lg"><PrinterIcon size={20} /></button>
+                        )}
+
+                        {reportMode === 'semester' && (
+                            <>
+                                <div className="text-center mb-10"><h2 className="text-4xl font-black border-b-4 border-black pb-3 inline-block px-12">{reportTitle}</h2></div>
+                                <table className="w-full border-collapse border-2 border-black">
+                                    <thead className="bg-slate-50">
+                                        <tr>
+                                            <th className="border border-black px-2 py-4 w-12 text-sm font-black">週次</th>
+                                            <th className="border border-black px-2 py-4 w-14 text-sm font-black">月份</th>
+                                            {['日','一','二','三','四','五','六'].map(d => <th key={d} className="border border-black px-2 py-4 w-11 text-xs font-black">{d}</th>)}
+                                            <th className="border border-black px-6 py-4 text-sm font-black">重要行事</th>
+                                        </tr>
+                                    </thead>
+                                    <tbody>
+                                        {tableData.map((row, idx) => (
+                                            <tr key={idx}>
+                                                <td className="border border-black py-4 text-center font-black bg-slate-50">{row.weekNum}</td>
+                                                <td className="border border-black py-4 text-center font-bold">{(idx === 0 || tableData[idx-1].month !== row.month) ? CHINESE_MONTHS[row.month - 1] : ""}</td>
+                                                {row.days.map((d, dIdx) => <td key={dIdx} className={`border border-black py-4 text-center text-sm ${d.isOffDay ? 'bg-gray-100 font-bold' : ''}`}>{d.num}</td>)}
+                                                <td className="border border-black p-4 align-top" style={{ fontSize: `${fontSize}px` }}>
+                                                    <div className="space-y-1.5">{row.events.map((ev, ei) => (
+                                                        <div key={ei} className="flex justify-between items-center group">
+                                                            <div className="flex gap-2">
+                                                                <span className="font-bold text-indigo-700 whitespace-nowrap">{formatEventLabel(ev.start)}</span>
+                                                                <span className="text-slate-900">{ev.cleanTitle}</span>
+                                                            </div>
+                                                            <button onClick={() => copyToEditor(ev)} className="opacity-0 group-hover:opacity-100 no-print text-slate-300 hover:text-indigo-600"><Icon name="copy" size={14} /></button>
+                                                        </div>
+                                                    ))}</div>
+                                                </td>
+                                            </tr>
+                                        ))}
+                                    </tbody>
+                                </table>
+                            </>
+                        )}
+
+                        {reportMode === 'weekly' && (
+                            <div>
+                                <div className="flex justify-between items-end border-b-4 border-black pb-4 mb-8">
+                                    <div>
+                                        <div className="flex items-center gap-4 mb-2">
+                                            <h2 className="text-3xl font-black">{reportTitle} - 週行事曆</h2>
+                                            <select value={selectedWeek} onChange={(e) => setSelectedWeek(parseInt(e.target.value))} className="no-print bg-indigo-50 font-bold text-indigo-700 px-2 py-1 rounded border">
+                                                {tableData.map(w => <option key={w.weekNum} value={w.weekNum}>第 {w.weekNum} 週</option>)}
+                                            </select>
+                                        </div>
+                                        <p className="text-lg font-bold text-slate-700">第 {selectedWeek} 週：{tableData[selectedWeek-1]?.weekStart.toLocaleDateString()} ～ {tableData[selectedWeek-1]?.weekEnd.toLocaleDateString()}</p>
+                                    </div>
+                                    <div className="text-xs font-bold border-2 border-black p-3 bg-slate-50">產製日期：{new Date().toLocaleDateString()}</div>
+                                </div>
+                                <div className="space-y-8">{Object.entries(categorizedEvents).map(([cat, evs]) => (
+                                    <div key={cat} className="border border-black">
+                                        <div className="bg-slate-100 border-b border-black px-5 py-3 font-black text-lg">📌 {cat}</div>
+                                        <div className="p-5 space-y-4">{evs.map((ev, i) => (
+                                            <div key={i} className="flex gap-6 items-start group" style={{ fontSize: `${fontSize+2}px` }}>
+                                                <div className="min-w-[100px] font-black text-indigo-700 bg-indigo-50 rounded text-center">{formatEventLabel(ev.start)}</div>
+                                                <div className="flex-1 font-bold text-slate-800">{ev.finalTitle}</div>
+                                                <button onClick={() => copyToEditor(ev)} className="opacity-0 group-hover:opacity-100 no-print text-slate-300 hover:text-indigo-600"><Icon name="copy" size={14} /></button>
+                                            </div>
+                                        ))}</div>
+                                    </div>
+                                ))}</div>
+                                <div className="mt-20 grid grid-cols-3 gap-12 no-print-flex">
+                                    <div className="text-center"><div className="h-24 border-b-2 border-black mb-3" /><p className="font-black text-sm uppercase">承辦人簽章</p></div>
+                                    <div className="text-center"><div className="h-24 border-b-2 border-black mb-3" /><p className="font-black text-sm uppercase">處室主管簽章</p></div>
+                                    <div className="text-center"><div className="h-24 border-b-2 border-black mb-3" /><p className="font-black text-sm uppercase">校長簽章</p></div>
+                                </div>
+                            </div>
+                        )}
+
+                        {reportMode === 'monitoring' && (
+                            <div>
+                                <div className="text-center mb-8"><h2 className="text-3xl font-black border-b-4 border-black pb-2 inline-block px-10 uppercase">{reportTitle} - 監控報表</h2><p className="mt-4 text-lg font-bold text-indigo-700">區間：{monitorStart} 至 {monitorEnd}</p></div>
+                                <div className="grid grid-cols-3 gap-6 mb-10 border-2 border-black p-6 bg-slate-50">
+                                    <div className="text-center"><p className="text-slate-500 text-xs font-black">區間總項數</p><p className="text-3xl font-black">{monitorAnalysis.total}</p></div>
+                                    <div className="text-center"><p className="text-emerald-600 text-xs font-black">已達成 (100%)</p><p className="text-3xl font-black">{monitorAnalysis.completed.length}</p></div>
+                                    <div className="text-center"><p className="text-indigo-600 text-xs font-black">平均執行率</p><p className="text-3xl font-black">{monitorAnalysis.avg}%</p></div>
+                                </div>
+                                <div className="space-y-12">
+                                    <div className="border border-emerald-200 rounded-xl overflow-hidden">
+                                        <div className="bg-emerald-50 px-6 py-3 font-black text-emerald-900 border-b border-emerald-200 flex justify-between"><span>已達成事項 (100%)</span> <span>{monitorAnalysis.completed.length} 項</span></div>
+                                        {monitorAnalysis.completed.map((ev, i) => (
+                                            <div key={i} className="px-6 py-4 flex justify-between border-b last:border-0">
+                                                <div className="flex gap-4"><span className="text-sm font-black text-emerald-700">{formatEventLabel(ev.start)}</span><span className="text-sm font-bold text-slate-800">{ev.cleanTitle}</span></div>
+                                                <button onClick={() => copyToEditor(ev)} className="no-print text-slate-300 hover:text-indigo-600"><Icon name="copy" size={14} /></button>
+                                            </div>
+                                        ))}
+                                    </div>
+                                    <div className="border border-indigo-200 rounded-xl overflow-hidden">
+                                        <div className="bg-indigo-50 px-6 py-3 font-black text-indigo-900 border-b border-indigo-200 flex justify-between"><span>執行中事項 (未滿 100%)</span> <span>{monitorAnalysis.incomplete.length} 項</span></div>
+                                        {monitorAnalysis.incomplete.map((ev, i) => (
+                                            <div key={i} className="px-6 py-4 flex justify-between border-b last:border-0 group">
+                                                <div className="flex-1 pr-10">
+                                                    <div className="flex gap-4 mb-2"><span className="text-sm font-black text-indigo-700">{formatEventLabel(ev.start)}</span><span className="text-sm font-bold text-slate-800">{ev.cleanTitle}</span></div>
+                                                    <div className="flex items-center gap-3"><div className="flex-1 bg-slate-100 h-1.5 rounded-full overflow-hidden"><div className="bg-indigo-500 h-full" style={{ width: `${ev.progress}%` }} /></div><span className="text-[10px] font-black w-8">{ev.progress}%</span></div>
+                                                </div>
+                                                <button onClick={() => copyToEditor(ev)} className="no-print opacity-0 group-hover:opacity-100 text-slate-300 hover:text-indigo-600"><Icon name="copy" size={14} /></button>
+                                            </div>
+                                        ))}
+                                    </div>
+                                </div>
+                            </div>
+                        )}
+
+                        {reportMode === 'editor' && (
+                            <div>
+                                <div className="flex items-center gap-3 mb-8 border-b pb-4"><h2 className="text-2xl font-black">事件編輯與匯出</h2><div className="ml-auto"><button onClick={exportCSV} className="bg-emerald-600 text-white px-6 py-2 rounded-xl font-bold">匯出 Google CSV ({stagedEvents.length})</button></div></div>
+                                <div className="grid grid-cols-1 lg:grid-cols-3 gap-8">
+                                    <div className="bg-slate-50 p-6 rounded-2xl border">
+                                        <h3 className="font-black text-lg mb-4">新增行程</h3>
+                                        <div className="space-y-4">
+                                            <input type="date" value={editForm.date} onChange={(e) => setEditForm({...editForm, date: e.target.value})} className="w-full rounded-xl border p-3" />
+                                            <select value={editForm.office} onChange={(e) => setEditForm({...editForm, office: e.target.value})} className="w-full rounded-xl border p-3">
+                                                {OFFICES.map(o => <option key={o} value={o}>{o}</option>)}
+                                            </select>
+                                            <input type="text" placeholder="行程標題" value={editForm.title} onChange={(e) => setEditForm({...editForm, title: e.target.value})} className="w-full rounded-xl border p-3" />
+                                            <input type="range" min="0" max="100" step="10" value={editForm.progress} onChange={(e) => setEditForm({...editForm, progress: e.target.value})} className="w-full" />
+                                            <button onClick={addToStaged} className="w-full bg-indigo-600 text-white py-3 rounded-xl font-black">加入預備名單</button>
+                                        </div>
+                                    </div>
+                                    <div className="lg:col-span-2 space-y-2">
+                                        {stagedEvents.map(ev => (
+                                            <div key={ev.id} className="bg-white border p-4 rounded-xl flex justify-between items-center shadow-sm">
+                                                <div className="flex gap-4">
+                                                    <div className="text-center font-black text-indigo-600 border-r pr-4">{ev.date.substring(5)}</div>
+                                                    <div className="font-bold">{ev.fullTitle}</div>
+                                                </div>
+                                                <button onClick={() => setStagedEvents(stagedEvents.filter(e => e.id !== ev.id))} className="text-red-400">刪除</button>
+                                            </div>
+                                        ))}
+                                    </div>
+                                </div>
+                            </div>
+                        )}
+                    </div>
+                </div>
+            );
+        };
+
+        const root = ReactDOM.createRoot(document.getElementById('root'));
+        root.render(<App />);
+    </script>
+</body>
+</html>
